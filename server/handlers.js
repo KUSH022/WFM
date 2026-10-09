@@ -2,6 +2,11 @@
  * All API route handlers. Each handler receives ({ db, user, params, query, body }) and returns JSON.
  * Kept in a single serverless function (api/index.js) so the project stays within the
  * Vercel Hobby plan function limit and shares one warm MongoDB connection.
+ *
+ * WFM rules audit (v1.1): scheduling handlers now delegate every business rule to server/rules.js,
+ * published schedules require Edit Mode, shifts keep their original date/location/department/job role,
+ * open shifts are assigned through a dedicated endpoint, and employee/location/schedule changes are
+ * audited with field-level before -> after details.
  */
 import dayjs from 'dayjs';
 import { newId } from './db.js';
@@ -9,13 +14,29 @@ import { HttpError } from './http.js';
 import { checkPassword, hashPassword, signToken, publicUser } from './auth.js';
 import { audit } from './audit.js';
 import { seedAll, DEPARTMENTS, JOB_TITLES } from './seed.js';
-import { fmt, weekStart, hoursBetween, paginate, regex, round2, calcTimecard, toMin } from './utils.js';
+import { fmt, weekStart, paginate, regex, round2, calcTimecard } from './utils.js';
+import {
+    getRules, invalidateRules, DEFAULT_RULES, validateShift, throwIfInvalid, assertIntegrity, assertEditable,
+    shiftHours, toList, employeeSkills, weekdayName, JOB_SKILLS,
+} from './rules.js';
 
-const MGR = ['Manager', 'Administrator'];
-const ADMIN = ['Administrator'];
+export const MGR = ['Manager', 'Administrator'];
+export const ADMIN = ['Administrator'];
 const today = () => fmt(dayjs());
 const fullName = (e) => `${e.firstName} ${e.lastName}`;
-const must = (cond, status, msg) => { if (!cond) throw new HttpError(status, msg); };
+export const must = (cond, status, msg) => { if (!cond) throw new HttpError(status, msg); };
+
+/** Field-level change list used in audit details, e.g. "hourlyRate: 15 → 16.5". */
+const show = (v) => {
+    if (v === null || v === undefined || v === '') return '∅';
+    if (Array.isArray(v) && v.length && typeof v[0] === 'object' && 'available' in v[0]) return v.filter((a) => a.available).map((a) => a.day).join('/') || 'none';
+    if (typeof v === 'object') return JSON.stringify(v).slice(0, 60);
+    return String(v);
+};
+export function diff(before, after, fields) {
+    return fields.filter((f) => after[f] !== undefined && JSON.stringify(before?.[f]) !== JSON.stringify(after[f]))
+        .map((f) => `${f}: ${show(before?.[f])} → ${show(after[f])}`);
+}
 
 // ============================== AUTH ==============================
 async function login({ db, body }) {
@@ -37,14 +58,17 @@ async function me({ db, user }) {
 
 // ============================== META / LOOKUPS ==============================
 async function meta({ db }) {
-    const [locations, employees, org] = await Promise.all([
+    const [locations, employees, org, rules] = await Promise.all([
         db.collection('locations').find({}, { projection: { name: 1, code: 1, region: 1, departments: 1, operatingHours: 1 } }).sort({ name: 1 }).toArray(),
-        db.collection('employees').find({}, { projection: { firstName: 1, lastName: 1, employeeId: 1, locationId: 1, department: 1, jobTitle: 1, hourlyRate: 1, status: 1, availability: 1, employmentType: 1 } }).sort({ firstName: 1 }).toArray(),
+        db.collection('employees').find({}, { projection: { firstName: 1, lastName: 1, employeeId: 1, locationId: 1, department: 1, jobTitle: 1, hourlyRate: 1, status: 1, employmentStatus: 1, availability: 1, employmentType: 1, skills: 1 } }).sort({ firstName: 1 }).toArray(),
         db.collection('settings').findOne({ _id: 'organization' }),
+        getRules(db),
     ]);
+    employees.forEach((e) => { e.effectiveSkills = employeeSkills(e, org?.jobProfiles); });
+    const skills = [...new Set(Object.values({ ...JOB_SKILLS, ...Object.fromEntries(Object.entries(org?.jobProfiles || {}).map(([k, v]) => [k, v.skills || []])) }).flat())].sort();
     return {
-        locations, employees, departments: org?.departments || DEPARTMENTS, jobTitles: org?.jobTitles || JOB_TITLES,
-        regions: org?.regions || [], managers: employees.filter((e) => ['Store Manager', 'Assistant Manager', 'Supervisor'].includes(e.jobTitle) && e.status === 'Active')
+        locations, employees, departments: org?.departments || DEPARTMENTS, jobTitles: org?.jobTitles || JOB_TITLES, skills,
+        regions: org?.regions || [], rules, managers: employees.filter((e) => ['Store Manager', 'Assistant Manager', 'Supervisor'].includes(e.jobTitle) && e.status === 'Active')
     };
 }
 
@@ -116,17 +140,29 @@ async function dashboard({ db, user }) {
 
 // ============================== EMPLOYEES ==============================
 const EMP_FIELDS = ['employeeId', 'firstName', 'lastName', 'email', 'phone', 'department', 'jobTitle', 'locationId', 'hireDate', 'hourlyRate',
-    'employmentType', 'employmentStatus', 'status', 'managerId', 'availability'];
-async function normalizeEmployee(db, body) {
+    'employmentType', 'employmentStatus', 'status', 'managerId', 'availability', 'skills'];
+export async function normalizeEmployee(db, body) {
     const doc = {};
     EMP_FIELDS.forEach((f) => body[f] !== undefined && (doc[f] = body[f]));
-    if (doc.hourlyRate !== undefined) doc.hourlyRate = round2(Number(doc.hourlyRate));
-    if (doc.locationId) doc.locationName = (await db.collection('locations').findOne({ _id: doc.locationId }))?.name || '';
+    if (doc.hourlyRate !== undefined) { doc.hourlyRate = round2(Number(doc.hourlyRate)); must(doc.hourlyRate > 0, 400, 'Hourly rate must be greater than 0'); }
+    if (doc.skills !== undefined) doc.skills = toList(doc.skills);
+    if (doc.locationId) {
+        const loc = await db.collection('locations').findOne({ _id: doc.locationId });
+        must(loc, 400, 'Location not found');
+        doc.locationName = loc.name;
+    }
     if (doc.managerId !== undefined) {
         const m = doc.managerId ? await db.collection('employees').findOne({ _id: doc.managerId }) : null;
         doc.managerName = m ? fullName(m) : ''; doc.managerId = m ? m._id : null;
     }
     return doc;
+}
+/** Inactive employees cannot hold shifts: future shifts are released back to open shifts. */
+export async function releaseFutureShifts(db, user, emp) {
+    const r = await db.collection('shifts').updateMany({ employeeId: emp._id, date: { $gte: today() } },
+        { $set: { employeeId: null, employeeName: '', cost: 0, posted: true, notes: `Released - ${fullName(emp)} inactive` } });
+    if (r.modifiedCount) await audit(db, user, 'RELEASE', 'Shift', `Released ${r.modifiedCount} future shift(s) of ${fullName(emp)} to open shifts (employee inactive)`, emp._id);
+    return r.modifiedCount;
 }
 async function listEmployees({ db, query }) {
     const f = {};
@@ -151,24 +187,31 @@ async function createEmployee({ db, user, body }) {
     };
     must(!(await db.collection('employees').findOne({ employeeId: e.employeeId })), 409, 'Employee ID already exists');
     await db.collection('employees').insertOne(e);
-    await audit(db, user, 'CREATE', 'Employee', `Created employee ${fullName(e)} (${e.employeeId})`, e._id);
+    await audit(db, user, 'CREATE', 'Employee', `Created employee ${fullName(e)} (${e.employeeId}) at ${e.locationName}, ${e.department} / ${e.jobTitle}`, e._id);
     return e;
 }
 async function updateEmployee({ db, user, params, body }) {
+    const before = await db.collection('employees').findOne({ _id: params.id });
+    must(before, 404, 'Employee not found');
     const doc = await normalizeEmployee(db, body);
     if (doc.status === 'Inactive' && !doc.employmentStatus) doc.employmentStatus = 'Terminated';
-    const r = await db.collection('employees').findOneAndUpdate({ _id: params.id }, { $set: doc }, { returnDocument: 'after' });
-    must(r, 404, 'Employee not found');
+    if (doc.employeeId && doc.employeeId !== before.employeeId)
+        must(!(await db.collection('employees').findOne({ employeeId: doc.employeeId })), 409, 'Employee ID already exists');
+    const r = await db.collection('employees').findOneAndUpdate({ _id: params.id }, { $set: { ...doc, updatedAt: new Date().toISOString() } }, { returnDocument: 'after' });
     if (doc.firstName || doc.lastName) await db.collection('shifts').updateMany({ employeeId: r._id }, { $set: { employeeName: fullName(r) } });
-    await audit(db, user, 'UPDATE', 'Employee', `Updated employee ${fullName(r)}`, r._id);
-    return r;
+    const changes = diff(before, doc, EMP_FIELDS.filter((f) => f !== 'managerId').concat('managerName'));
+    await audit(db, user, 'UPDATE', 'Employee', `Updated employee ${fullName(r)} (${r.employeeId})${changes.length ? ': ' + changes.join('; ') : ' (no changes)'}`, r._id);
+    let released = 0;
+    if (r.status !== 'Active' || ['Terminated', 'On Leave'].includes(r.employmentStatus)) released = await releaseFutureShifts(db, user, r);
+    return { ...r, releasedShifts: released };
 }
 async function deleteEmployee({ db, user, params }) {
     // Soft delete keeps history (timecards / shifts) intact
     const r = await db.collection('employees').findOneAndUpdate({ _id: params.id }, { $set: { status: 'Inactive', employmentStatus: 'Terminated' } }, { returnDocument: 'after' });
     must(r, 404, 'Employee not found');
     await audit(db, user, 'DEACTIVATE', 'Employee', `Deactivated employee ${fullName(r)}`, r._id);
-    return { ok: true };
+    const released = await releaseFutureShifts(db, user, r);
+    return { ok: true, releasedShifts: released };
 }
 
 // ============================== LOCATIONS ==============================
@@ -179,22 +222,26 @@ async function listLocations({ db }) {
     ]);
     return locs.map((l) => ({ ...l, employeeCount: counts.find((c) => c._id === l._id)?.n || 0 }));
 }
-const LOC_FIELDS = ['name', 'code', 'region', 'address', 'city', 'phone', 'costCenter', 'status', 'operatingHours', 'departments', 'weeklyLaborBudget', 'baseTraffic'];
+export const LOC_FIELDS = ['name', 'code', 'region', 'address', 'city', 'phone', 'costCenter', 'status', 'operatingHours', 'departments', 'weeklyLaborBudget', 'baseTraffic'];
 const pickLoc = (b) => { const d = {}; LOC_FIELDS.forEach((f) => b[f] !== undefined && (d[f] = b[f])); if (d.weeklyLaborBudget !== undefined) d.weeklyLaborBudget = Number(d.weeklyLaborBudget) || 0; return d; };
 async function createLocation({ db, user, body }) {
     must(body.name && body.costCenter, 400, 'Name and cost center are required');
     const l = { _id: newId(), status: 'Active', baseTraffic: 450, departments: DEPARTMENTS.map((n) => ({ name: n, parent: null })), ...pickLoc(body), createdAt: new Date().toISOString() };
+    if (l.code) must(!(await db.collection('locations').findOne({ code: l.code })), 409, `Location code ${l.code} already exists`);
     await db.collection('locations').insertOne(l);
-    await audit(db, user, 'CREATE', 'Location', `Created location ${l.name}`, l._id);
+    await audit(db, user, 'CREATE', 'Location', `Created location ${l.name} (${l.costCenter})`, l._id);
     return l;
 }
 async function updateLocation({ db, user, params, body }) {
-    const r = await db.collection('locations').findOneAndUpdate({ _id: params.id }, { $set: pickLoc(body) }, { returnDocument: 'after' });
-    must(r, 404, 'Location not found');
+    const before = await db.collection('locations').findOne({ _id: params.id });
+    must(before, 404, 'Location not found');
+    const d = pickLoc(body);
+    const r = await db.collection('locations').findOneAndUpdate({ _id: params.id }, { $set: { ...d, updatedAt: new Date().toISOString() } }, { returnDocument: 'after' });
     if (body.name) await db.collection('employees').updateMany({ locationId: r._id }, { $set: { locationName: r.name } });
     if (body.weeklyLaborBudget !== undefined)
         await db.collection('laborbudgets').updateOne({ locationId: r._id, weekStart: fmt(weekStart()) }, { $set: { budgetAmount: Number(body.weeklyLaborBudget) } });
-    await audit(db, user, 'UPDATE', 'Location', `Updated location ${r.name}`, r._id);
+    const changes = diff(before, d, LOC_FIELDS);
+    await audit(db, user, 'UPDATE', 'Location', `Updated location ${r.name}${changes.length ? ': ' + changes.join('; ') : ' (no changes)'}`, r._id);
     return r;
 }
 async function deleteLocation({ db, user, params }) {
@@ -218,68 +265,123 @@ async function listShifts({ db, user, query }) {
     } else if (query.employeeId) f.employeeId = query.employeeId;
     return db.collection('shifts').find(f).sort({ date: 1, start: 1 }).toArray();
 }
-async function buildShift(db, body, existing = {}) {
-    const s = { ...existing };
-    ['locationId', 'date', 'start', 'end', 'department', 'jobTitle', 'notes', 'shiftType', 'posted'].forEach((k) => body[k] !== undefined && (s[k] = body[k]));
-    if (body.employeeId !== undefined) s.employeeId = body.employeeId || null;
-    must(s.locationId && s.date && s.start && s.end, 400, 'Location, date, start and end are required');
+
+/** Recompute derived shift fields after validation. */
+function finalizeShift(s, employee, rules) {
     s.weekStart = fmt(weekStart(s.date));
-    s.hours = hoursBetween(s.start, s.end);
-    if (s.employeeId) {
-        const e = await db.collection('employees').findOne({ _id: s.employeeId });
-        must(e, 404, 'Employee not found');
-        must(e.status === 'Active', 400, `${fullName(e)} is inactive`);
-        const clash = await db.collection('shifts').find({ employeeId: e._id, date: s.date, _id: { $ne: s._id || '' } }).toArray();
-        must(!clash.some((c) => toMin(c.start) < toMin(s.end) && toMin(s.start) < toMin(c.end)), 409, `${fullName(e)} already has an overlapping shift on ${s.date}`);
-        s.employeeName = fullName(e); s.rate = e.hourlyRate; s.department = body.department || e.department; s.jobTitle = body.jobTitle || e.jobTitle;
-        s.posted = false;
+    s.hours = shiftHours(s);
+    if (employee) {
+        s.employeeName = fullName(employee); s.rate = employee.hourlyRate; s.posted = false;
     } else { s.employeeName = ''; s.rate = s.rate || 16; }
     s.cost = s.employeeId ? round2(s.hours * s.rate) : 0;
-    s.overtime = s.hours > 8;
-    s.published = false; // any change returns the shift to draft until re-published
+    s.overtime = s.hours > 8 || s.hours > rules.overtimeThresholdDaily;
+    s.requiredSkills = toList(s.requiredSkills);
     return s;
 }
-async function markDraft(db, s) {
-    await db.collection('schedules').updateOne({ locationId: s.locationId, weekStart: s.weekStart },
-        { $set: { hasUnpublishedChanges: true }, $setOnInsert: { _id: newId(), status: 'Draft' } }, { upsert: true });
+
+/** Mark the location-week schedule as having unpublished changes; creates the schedule header if new. */
+async function markDraft(db, user, s) {
+    const r = await db.collection('schedules').updateOne({ locationId: s.locationId, weekStart: s.weekStart },
+        { $set: { hasUnpublishedChanges: true }, $setOnInsert: { _id: newId(), status: 'Draft', editMode: false, createdAt: new Date().toISOString(), createdBy: user?.name || 'System' } }, { upsert: true });
+    if (r.upsertedCount) await audit(db, user, 'CREATE', 'Schedule', `Created draft schedule for location ${s.locationId}, week of ${s.weekStart}`);
 }
-async function createShift({ db, user, body }) {
-    const s = await buildShift(db, body, { _id: newId(), shiftType: 'Custom' });
+
+const shiftLabel = (s) => `${s.employeeName || 'Open'} ${s.date} (${weekdayName(s.date)}) ${s.start}-${s.end} ${s.department}/${s.jobTitle}`;
+
+export async function createShiftCore(db, user, body, { source = 'UI' } = {}) {
+    const rules = await getRules(db);
+    must(body.locationId && body.date && body.start && body.end, 400, 'Location, date, start and end are required');
+    must(body.department && body.jobTitle, 400, 'Department and job role are required for every shift');
+    const s = {
+        _id: newId(), shiftType: body.shiftType || 'Custom', locationId: body.locationId, date: body.date, start: body.start, end: body.end,
+        department: body.department, jobTitle: body.jobTitle, requiredSkills: body.requiredSkills, notes: body.notes || '', posted: !!body.posted,
+        employeeId: body.employeeId || null, externalId: body.externalId || null, published: false,
+        createdAt: new Date().toISOString(), createdBy: user?.name || 'System', source
+    };
+    s.weekStart = fmt(weekStart(s.date));
+    await assertEditable(db, s.locationId, s.weekStart, rules);
+    const v = await validateShift(db, s, { rules });
+    throwIfInvalid(v);
+    finalizeShift(s, v.employee, rules);
     await db.collection('shifts').insertOne(s);
-    await markDraft(db, s);
-    await audit(db, user, 'CREATE', 'Shift', `Created ${s.employeeName ? 'shift for ' + s.employeeName : 'open shift'} on ${s.date} ${s.start}-${s.end}`, s._id);
-    return s;
+    await markDraft(db, user, s);
+    await audit(db, user, 'CREATE', 'Shift', `Created ${s.employeeId ? 'shift' : 'open shift'}: ${shiftLabel(s)}${source !== 'UI' ? ` [${source}]` : ''}`, s._id);
+    return { ...s, warnings: v.warnings };
 }
-async function updateShift({ db, user, params, body }) {
+async function createShift({ db, user, body }) { return createShiftCore(db, user, body); }
+
+export async function updateShiftCore(db, user, id, body, { source = 'UI' } = {}) {
+    const rules = await getRules(db);
+    const ex = await db.collection('shifts').findOne({ _id: id });
+    must(ex, 404, 'Shift not found');
+    assertIntegrity(ex, body);                                  // date / location / department / job role are locked
+    await assertEditable(db, ex.locationId, ex.weekStart, rules);
+    const s = { ...ex };
+    ['start', 'end', 'notes', 'posted', 'requiredSkills'].forEach((k) => body[k] !== undefined && (s[k] = body[k]));
+    if (body.employeeId !== undefined) s.employeeId = body.employeeId || null;
+    const ruleRelevant = s.employeeId !== ex.employeeId || s.start !== ex.start || s.end !== ex.end || JSON.stringify(toList(s.requiredSkills)) !== JSON.stringify(toList(ex.requiredSkills));
+    let v = { errors: [], warnings: [], employee: null };
+    if (ruleRelevant) { v = await validateShift(db, s, { rules, ignoreId: ex._id }); throwIfInvalid(v); }
+    const employee = v.employee || (s.employeeId ? await db.collection('employees').findOne({ _id: s.employeeId }) : null);
+    finalizeShift(s, employee, rules);
+    s.published = false;                                        // change returns the shift to draft until re-published
+    s.updatedAt = new Date().toISOString(); s.updatedBy = user?.name || 'System';
+    await db.collection('shifts').replaceOne({ _id: s._id }, s);
+    await markDraft(db, user, s);
+    const changes = diff(ex, s, ['employeeName', 'start', 'end', 'notes', 'posted', 'requiredSkills']);
+    const action = !ex.employeeId && s.employeeId ? 'ASSIGN' : ex.employeeId && !s.employeeId ? 'UNASSIGN' : 'UPDATE';
+    await audit(db, user, action, action === 'ASSIGN' ? 'Open Shift' : 'Shift',
+        `${action === 'ASSIGN' ? 'Assigned open shift' : 'Edited shift'} ${ex.date} (${weekdayName(ex.date)}) ${ex.department}/${ex.jobTitle}: ${changes.join('; ') || 'no changes'}${source !== 'UI' ? ` [${source}]` : ''}`, s._id);
+    return { ...s, warnings: v.warnings };
+}
+async function updateShift({ db, user, params, body }) { return updateShiftCore(db, user, params.id, body); }
+
+/** Assign an open shift to an employee. The open shift's date can never change. */
+async function assignOpenShift({ db, user, params, body }) {
     const ex = await db.collection('shifts').findOne({ _id: params.id });
     must(ex, 404, 'Shift not found');
-    const s = await buildShift(db, body, ex);
-    await db.collection('shifts').replaceOne({ _id: s._id }, s);
-    await markDraft(db, s);
-    await audit(db, user, 'UPDATE', 'Shift', `Edited shift ${ex.employeeName || 'open'} ${ex.date} ${ex.start}-${ex.end} -> ${s.employeeName || 'open'} ${s.date} ${s.start}-${s.end}`, s._id);
-    return s;
+    must(!ex.employeeId, 409, `This shift is already assigned to ${ex.employeeName}`);
+    must(body.employeeId, 400, 'employeeId is required');
+    if (body.date && body.date !== ex.date)
+        throw new HttpError(409, `Open shifts belong to their date: this ${weekdayName(ex.date)} shift (${ex.date}) can only be assigned on ${weekdayName(ex.date)}.`);
+    return updateShiftCore(db, user, ex._id, { employeeId: body.employeeId });
 }
+
 async function deleteShift({ db, user, params }) {
+    const rules = await getRules(db);
     const s = await db.collection('shifts').findOne({ _id: params.id });
     must(s, 404, 'Shift not found');
+    await assertEditable(db, s.locationId, s.weekStart, rules);
     await db.collection('shifts').deleteOne({ _id: s._id });
-    await markDraft(db, s);
-    await audit(db, user, 'DELETE', 'Shift', `Deleted shift ${s.employeeName || 'open'} on ${s.date}`, s._id);
+    await markDraft(db, user, s);
+    await audit(db, user, 'DELETE', 'Shift', `Deleted shift ${shiftLabel(s)}`, s._id);
     return { ok: true };
 }
+
+/** Employee self-service pickup of a posted, published open shift (same rules as manager assignment). */
 async function claimShift({ db, user, params }) {
+    const rules = await getRules(db);
+    must(rules.allowShiftPickup, 403, 'Open shift pickup is disabled by your administrator');
     must(user.employeeId, 400, 'Your login is not linked to an employee record');
-    const s = await db.collection('shifts').findOne({ _id: params.id, employeeId: null, posted: true });
+    const s = await db.collection('shifts').findOne({ _id: params.id, employeeId: null, posted: true, published: true });
     must(s, 404, 'This open shift is no longer available');
-    const upd = await buildShift(db, { employeeId: user.employeeId }, s);
+    const upd = { ...s, employeeId: user.employeeId };
+    const v = await validateShift(db, upd, { rules, ignoreId: s._id });
+    throwIfInvalid(v);
+    finalizeShift(upd, v.employee, rules);
     upd.published = true; // pickup of a published open shift stays published
-    await db.collection('shifts').replaceOne({ _id: s._id }, upd);
-    await audit(db, user, 'CLAIM', 'Shift', `Picked up open shift on ${s.date} ${s.start}-${s.end}`, s._id);
-    return upd;
+    upd.updatedAt = new Date().toISOString(); upd.updatedBy = user.name;
+    // Atomic guard: only succeeds if nobody claimed it in the meantime
+    const r = await db.collection('shifts').replaceOne({ _id: s._id, employeeId: null }, upd);
+    must(r.modifiedCount === 1, 409, 'This open shift was just taken by someone else');
+    await audit(db, user, 'ASSIGN', 'Open Shift', `Picked up open shift ${s.date} (${weekdayName(s.date)}) ${s.start}-${s.end} ${s.department}/${s.jobTitle}`, s._id);
+    return { ...upd, warnings: v.warnings };
 }
+
 async function listSchedules({ db, query }) {
     const ws = query.weekStart || fmt(weekStart());
-    const [locs, scheds, agg] = await Promise.all([
+    const rules = await getRules(db);
+    const [locs, scheds, agg, budgets] = await Promise.all([
         db.collection('locations').find({}).sort({ name: 1 }).toArray(),
         db.collection('schedules').find({ weekStart: ws }).toArray(),
         db.collection('shifts').aggregate([{ $match: { weekStart: ws } }, {
@@ -289,39 +391,84 @@ async function listSchedules({ db, query }) {
                 cost: { $sum: '$cost' }, unpublished: { $sum: { $cond: ['$published', 0, 1] } }
             }
         }]).toArray(),
+        db.collection('laborbudgets').find({ weekStart: ws }).toArray(),
     ]);
     return locs.map((l) => {
         const s = scheds.find((x) => x.locationId === l._id) || {}; const a = agg.find((x) => x._id === l._id) || {};
+        const b = budgets.find((x) => x.locationId === l._id);
+        const cost = round2(a.cost);
         return {
             locationId: l._id, locationName: l.name, weekStart: ws, status: s.status || 'Not Started', publishedAt: s.publishedAt || null,
-            shifts: a.shifts || 0, hours: a.hours || 0, open: a.open || 0, cost: round2(a.cost), unpublished: a.unpublished || 0
+            editMode: !!s.editMode, locked: rules.requireEditModeForPublished && s.status === 'Published' && !s.editMode,
+            shifts: a.shifts || 0, hours: a.hours || 0, open: a.open || 0, cost, unpublished: a.unpublished || 0,
+            budgetAmount: b?.budgetAmount || null, budgetUtilization: b?.budgetAmount ? Math.round((cost / b.budgetAmount) * 100) : null,
+            overBudget: !!(b?.budgetAmount && cost > b.budgetAmount * (rules.budgetWarningPct / 100))
         };
     });
+}
+/** Turn Edit Mode on/off for a published schedule. */
+async function setEditMode({ db, user, body }) {
+    must(body.locationId && body.weekStart, 400, 'locationId and weekStart are required');
+    const sc = await db.collection('schedules').findOne({ locationId: body.locationId, weekStart: body.weekStart });
+    must(sc, 404, 'Schedule not found');
+    must(sc.status === 'Published', 400, 'Edit Mode only applies to published schedules');
+    const enabled = !!body.enabled;
+    await db.collection('schedules').updateOne({ _id: sc._id }, { $set: { editMode: enabled, editModeBy: user.name, editModeAt: new Date().toISOString() } });
+    await audit(db, user, 'EDIT_MODE', 'Schedule', `${enabled ? 'Enabled' : 'Disabled'} edit mode for ${sc.locationName || body.locationId}, week of ${body.weekStart}`, sc._id);
+    return { ok: true, editMode: enabled };
 }
 async function publishSchedule({ db, user, body }) {
     must(body.locationId && body.weekStart, 400, 'locationId and weekStart are required');
     const loc = await db.collection('locations').findOne({ _id: body.locationId });
     must(loc, 404, 'Location not found');
+    const changed = await db.collection('shifts').countDocuments({ locationId: loc._id, weekStart: body.weekStart, published: false });
     const r = await db.collection('shifts').updateMany({ locationId: loc._id, weekStart: body.weekStart }, { $set: { published: true } });
-    await db.collection('schedules').updateOne({ locationId: loc._id, weekStart: body.weekStart },
-        { $set: { status: 'Published', locationName: loc.name, publishedAt: new Date().toISOString(), publishedBy: user.name, hasUnpublishedChanges: false }, $setOnInsert: { _id: newId() } }, { upsert: true });
-    await audit(db, user, 'PUBLISH', 'Schedule', `Published schedule for ${loc.name}, week of ${body.weekStart} (${r.matchedCount} shifts)`);
-    return { ok: true, published: r.matchedCount };
+    const up = await db.collection('schedules').updateOne({ locationId: loc._id, weekStart: body.weekStart },
+        { $set: { status: 'Published', locationName: loc.name, publishedAt: new Date().toISOString(), publishedBy: user.name, hasUnpublishedChanges: false, editMode: false }, $setOnInsert: { _id: newId() } }, { upsert: true });
+    if (up.upsertedCount) await audit(db, user, 'CREATE', 'Schedule', `Created schedule for ${loc.name}, week of ${body.weekStart}`);
+    await audit(db, user, 'PUBLISH', 'Schedule', `Published schedule for ${loc.name}, week of ${body.weekStart} (${r.matchedCount} shifts, ${changed} changed since last publish); edit mode closed`);
+    return { ok: true, published: r.matchedCount, changed };
 }
+/**
+ * Copy a week. Copies keep weekday, location, department and job role.
+ * Assignments that would break rules in the target week (inactive employee, unavailable day,
+ * approved time off) are converted into open shifts.
+ */
 async function copySchedule({ db, user, body }) {
+    const rules = await getRules(db);
     const { locationId, fromWeek, toWeek, replace } = body;
     must(locationId && fromWeek && toWeek && fromWeek !== toWeek, 400, 'locationId, fromWeek and a different toWeek are required');
+    must(fmt(weekStart(toWeek)) === toWeek && fmt(weekStart(fromWeek)) === fromWeek, 400, 'fromWeek and toWeek must be Mondays');
+    await assertEditable(db, locationId, toWeek, rules);
     const src = await db.collection('shifts').find({ locationId, weekStart: fromWeek }).toArray();
     must(src.length, 404, 'Source week has no shifts to copy');
     const existing = await db.collection('shifts').countDocuments({ locationId, weekStart: toWeek });
     must(!existing || replace, 409, `Target week already has ${existing} shifts. Enable "replace" to overwrite.`);
     if (existing) await db.collection('shifts').deleteMany({ locationId, weekStart: toWeek });
-    const diff = dayjs(toWeek).diff(dayjs(fromWeek), 'day');
-    const copies = src.map((s) => ({ ...s, _id: newId(), date: fmt(dayjs(s.date).add(diff, 'day')), weekStart: toWeek, published: false }));
+    const diffDays = dayjs(toWeek).diff(dayjs(fromWeek), 'day');
+    const [emps, offs] = await Promise.all([
+        db.collection('employees').find({ locationId }).toArray(),
+        db.collection('timeoffrequests').find({ locationId, status: 'Approved', endDate: { $gte: toWeek }, startDate: { $lte: fmt(dayjs(toWeek).add(6, 'day')) } }).toArray(),
+    ]);
+    let opened = 0;
+    const copies = src.map((s) => {
+        const date = fmt(dayjs(s.date).add(diffDays, 'day'));
+        const c = { ...s, _id: newId(), date, weekStart: toWeek, published: false, copiedFrom: s._id, createdAt: new Date().toISOString(), createdBy: user.name };
+        if (c.employeeId) {
+            const e = emps.find((x) => x._id === c.employeeId);
+            const idx = (dayjs(date).day() + 6) % 7;
+            const bad = !e || e.status !== 'Active' || ['Terminated', 'On Leave'].includes(e.employmentStatus) || e.department !== c.department
+                || (rules.enforceAvailability && e.availability?.[idx]?.available === false)
+                || offs.some((o) => o.employeeId === c.employeeId && o.startDate <= date && o.endDate >= date);
+            if (bad) { opened++; Object.assign(c, { employeeId: null, employeeName: '', cost: 0, posted: false, notes: 'Converted to open shift during copy (rule check)' }); }
+        }
+        return c;
+    });
     await db.collection('shifts').insertMany(copies);
-    await db.collection('schedules').updateOne({ locationId, weekStart: toWeek }, { $set: { status: 'Draft', hasUnpublishedChanges: true }, $setOnInsert: { _id: newId() } }, { upsert: true });
-    await audit(db, user, 'COPY', 'Schedule', `Copied ${copies.length} shifts from week ${fromWeek} to ${toWeek}`);
-    return { ok: true, copied: copies.length };
+    const up = await db.collection('schedules').updateOne({ locationId, weekStart: toWeek },
+        { $set: { status: 'Draft', hasUnpublishedChanges: true, editMode: false }, $setOnInsert: { _id: newId(), createdAt: new Date().toISOString(), createdBy: user.name } }, { upsert: true });
+    await audit(db, user, up.upsertedCount ? 'CREATE' : 'COPY', 'Schedule', `Copied ${copies.length} shifts for ${locationId} from week ${fromWeek} to ${toWeek}${opened ? ` (${opened} converted to open shifts)` : ''}`);
+    return { ok: true, copied: copies.length, convertedToOpen: opened };
 }
 
 // ============================== TIME & ATTENDANCE ==============================
@@ -358,6 +505,7 @@ async function punch({ db, user, body }) {
     if (action === 'in') {
         must(!card, 400, 'You have already clocked in today');
         const [emp, shift] = await Promise.all([db.collection('employees').findOne({ _id: user.employeeId }), db.collection('shifts').findOne({ employeeId: user.employeeId, date })]);
+        must(emp && emp.status === 'Active', 403, 'Inactive employees cannot clock in');
         card = {
             _id: newId(), employeeId: emp._id, employeeName: fullName(emp), locationId: emp.locationId, shiftId: shift?._id || null, date,
             scheduledStart: shift?.start || null, scheduledEnd: shift?.end || null, clockIn: time, mealStart: null, mealEnd: null, clockOut: null,
@@ -387,7 +535,8 @@ async function updateTimecard({ db, user, params, body }) {
     card.resolved = body.resolved !== undefined ? !!body.resolved : card.exceptions.length === 0;
     if (card.resolved) { card.resolvedBy = user.name; card.resolvedAt = new Date().toISOString(); }
     await db.collection('timecards').replaceOne({ _id: card._id }, card);
-    await audit(db, user, 'UPDATE', 'Timecard', `Edited timecard for ${card.employeeName} on ${card.date}${card.resolved ? ' (exception resolved)' : ''}`, card._id);
+    const changes = diff(ex, card, ['clockIn', 'mealStart', 'mealEnd', 'clockOut', 'notes']);
+    await audit(db, user, 'UPDATE', 'Timecard', `Edited timecard for ${card.employeeName} on ${card.date}${changes.length ? ': ' + changes.join('; ') : ''}${card.resolved ? ' (exception resolved)' : ''}`, card._id);
     return card;
 }
 
@@ -400,8 +549,7 @@ async function listTimeoff({ db, user, query }) {
     if (query.q) f.employeeName = regex(query.q);
     return paginate(db.collection('timeoffrequests'), f, query, { status: -1, startDate: 1 });
 }
-async function createTimeoff({ db, user, body }) {
-    const eid = user.role === 'Employee' ? user.employeeId : body.employeeId || user.employeeId;
+export async function createTimeoffCore(db, user, eid, body) {
     must(eid, 400, 'Employee is required');
     must(['Vacation', 'Sick', 'Personal'].includes(body.type), 400, 'Type must be Vacation, Sick or Personal');
     must(body.startDate && body.endDate && body.endDate >= body.startDate, 400, 'Valid start and end dates are required');
@@ -413,11 +561,15 @@ async function createTimeoff({ db, user, body }) {
     const t = {
         _id: newId(), employeeId: e._id, employeeName: fullName(e), locationId: e.locationId, department: e.department, type: body.type,
         startDate: body.startDate, endDate: body.endDate, days, hours: Number(body.hours) || days * 8, reason: body.reason || '', status: 'Pending',
-        submittedAt: new Date().toISOString(), decidedAt: null, decidedBy: null, comment: ''
+        submittedAt: new Date().toISOString(), decidedAt: null, decidedBy: null, comment: '', externalId: body.externalId || null
     };
     await db.collection('timeoffrequests').insertOne(t);
     await audit(db, user, 'CREATE', 'Time Off', `${t.type} request ${t.startDate} to ${t.endDate} for ${t.employeeName}`, t._id);
     return t;
+}
+async function createTimeoff({ db, user, body }) {
+    const eid = user.role === 'Employee' ? user.employeeId : body.employeeId || user.employeeId;
+    return createTimeoffCore(db, user, eid, body);
 }
 async function decideTimeoff({ db, user, params, body }) {
     must(['Approved', 'Rejected'].includes(body.decision), 400, 'Decision must be Approved or Rejected');
@@ -426,8 +578,11 @@ async function decideTimeoff({ db, user, params, body }) {
     must(t.status === 'Pending', 400, `Request is already ${t.status}`);
     const upd = { status: body.decision, decidedAt: new Date().toISOString(), decidedBy: user.name, comment: body.comment || '' };
     await db.collection('timeoffrequests').updateOne({ _id: t._id }, { $set: upd });
-    await audit(db, user, body.decision === 'Approved' ? 'APPROVE' : 'REJECT', 'Time Off', `${body.decision} ${t.type} request for ${t.employeeName} (${t.startDate} to ${t.endDate})`, t._id);
-    return { ...t, ...upd };
+    // Warn the approver about scheduled shifts that now conflict with approved leave
+    const conflicts = body.decision === 'Approved'
+        ? await db.collection('shifts').countDocuments({ employeeId: t.employeeId, date: { $gte: t.startDate, $lte: t.endDate } }) : 0;
+    await audit(db, user, body.decision === 'Approved' ? 'APPROVE' : 'REJECT', 'Time Off', `${body.decision} ${t.type} request for ${t.employeeName} (${t.startDate} to ${t.endDate})${conflicts ? ` - ${conflicts} scheduled shift(s) conflict` : ''}`, t._id);
+    return { ...t, ...upd, warnings: conflicts ? [`${t.employeeName} has ${conflicts} scheduled shift(s) during this leave. Reassign them in Scheduling.`] : [] };
 }
 async function cancelTimeoff({ db, user, params }) {
     const t = await db.collection('timeoffrequests').findOne({ _id: params.id });
@@ -486,7 +641,7 @@ async function generateForecast({ db, user, body }) {
 }
 
 // ============================== LABOR BUDGETING ==============================
-async function listBudgets({ db, query }) {
+export async function listBudgets({ db, query }) {
     const f = query.locationId ? { locationId: query.locationId } : {};
     const [budgets, sched, actual] = await Promise.all([
         db.collection('laborbudgets').find(f).sort({ weekStart: 1, locationName: 1 }).toArray(),
@@ -509,13 +664,14 @@ async function listBudgets({ db, query }) {
     });
 }
 async function updateBudget({ db, user, params, body }) {
+    const before = await db.collection('laborbudgets').findOne({ _id: params.id });
+    must(before, 404, 'Budget not found');
     const d = {};
-    ['budgetHours', 'budgetAmount'].forEach((k) => body[k] !== undefined && (d[k] = Number(body[k])));
+    ['budgetHours', 'budgetAmount'].forEach((k) => { if (body[k] !== undefined) { d[k] = Number(body[k]); must(d[k] >= 0, 400, `${k} must be zero or positive`); } });
     if (body.notes !== undefined) d.notes = body.notes;
     const r = await db.collection('laborbudgets').findOneAndUpdate({ _id: params.id }, { $set: d }, { returnDocument: 'after' });
-    must(r, 404, 'Budget not found');
     if (r.weekStart === fmt(weekStart()) && d.budgetAmount !== undefined) await db.collection('locations').updateOne({ _id: r.locationId }, { $set: { weeklyLaborBudget: d.budgetAmount } });
-    await audit(db, user, 'UPDATE', 'Labor Budget', `Updated labor budget for ${r.locationName}, week of ${r.weekStart}`, r._id);
+    await audit(db, user, 'UPDATE', 'Labor Budget', `Updated labor budget for ${r.locationName}, week of ${r.weekStart}: ${diff(before, d, ['budgetHours', 'budgetAmount', 'notes']).join('; ') || 'no changes'}`, r._id);
     return r;
 }
 
@@ -599,6 +755,7 @@ async function createUser({ db, user, body }) {
 async function updateUser({ db, user, params, body }) {
     const d = {};
     ['name', 'role', 'active', 'employeeId'].forEach((k) => body[k] !== undefined && (d[k] = body[k]));
+    if (d.role) must(['Employee', 'Manager', 'Administrator'].includes(d.role), 400, 'Invalid role');
     if (body.password) { must(String(body.password).length >= 6, 400, 'Password must be at least 6 characters'); d.password = hashPassword(body.password); }
     must(!(params.id === user.sub && (d.active === false || (d.role && d.role !== 'Administrator'))), 400, 'You cannot disable or demote your own account');
     const r = await db.collection('users').findOneAndUpdate({ _id: params.id }, { $set: d }, { returnDocument: 'after' });
@@ -615,13 +772,24 @@ async function deleteUser({ db, user, params }) {
 }
 async function getSettings({ db }) {
     const docs = await db.collection('settings').find({}).toArray();
-    return Object.fromEntries(docs.map((d) => [d._id, d]));
+    const out = Object.fromEntries(docs.map((d) => [d._id, d]));
+    out.system = { ...DEFAULT_RULES, ...(out.system || {}), _id: 'system' }; // new audit rules appear with defaults
+    return out;
 }
 async function updateSettings({ db, user, params, body }) {
     must(['organization', 'system', 'roles'].includes(params.key), 404, 'Unknown settings group');
     const { _id, ...rest } = body;
+    if (params.key === 'system') {
+        for (const [k, v] of Object.entries(rest)) {
+            if (typeof DEFAULT_RULES[k] === 'number') { rest[k] = Number(v); must(Number.isFinite(rest[k]) && rest[k] >= 0, 400, `${k} must be a positive number`); }
+            if (typeof DEFAULT_RULES[k] === 'boolean') rest[k] = v === true || v === 'true';
+        }
+        if (rest.maxDailyHours !== undefined && rest.maxWeeklyHours !== undefined) must(rest.maxDailyHours <= rest.maxWeeklyHours, 400, 'maxDailyHours cannot exceed maxWeeklyHours');
+    }
+    const before = await db.collection('settings').findOne({ _id: params.key });
     await db.collection('settings').updateOne({ _id: params.key }, { $set: rest }, { upsert: true });
-    await audit(db, user, 'UPDATE', 'Settings', `Updated ${params.key} settings`);
+    invalidateRules();
+    await audit(db, user, 'UPDATE', 'Settings', `Updated ${params.key} settings: ${diff(before || {}, rest, Object.keys(rest)).join('; ') || 'no changes'}`);
     return { ok: true };
 }
 async function listAudit({ db, query }) {
@@ -630,7 +798,7 @@ async function listAudit({ db, query }) {
     ['action', 'entity'].forEach((k) => query[k] && (f[k] = query[k]));
     return paginate(db.collection('auditlogs'), f, query, { timestamp: -1 });
 }
-async function reseed({ db, user }) { await seedAll(db); await audit(db, user, 'RESET', 'Database', 'Demo data reset by administrator'); return { ok: true }; }
+async function reseed({ db, user }) { await seedAll(db); invalidateRules(); await audit(db, user, 'RESET', 'Database', 'Demo data reset by administrator'); return { ok: true }; }
 async function health({ db }) { await db.command({ ping: 1 }); return { ok: true, time: new Date().toISOString() }; }
 
 /** Route table: [method, path pattern, handler, allowed roles (null = public, [] = any signed-in user)] */
@@ -645,8 +813,10 @@ export const routes = [
     ['GET', 'locations', listLocations, []], ['POST', 'locations', createLocation, MGR],
     ['PUT', 'locations/:id', updateLocation, MGR], ['DELETE', 'locations/:id', deleteLocation, ADMIN],
     ['GET', 'shifts', listShifts, []], ['POST', 'shifts', createShift, MGR], ['POST', 'shifts/:id/claim', claimShift, []],
+    ['POST', 'shifts/:id/assign', assignOpenShift, MGR],
     ['PUT', 'shifts/:id', updateShift, MGR], ['DELETE', 'shifts/:id', deleteShift, MGR],
     ['GET', 'schedules', listSchedules, MGR], ['POST', 'schedules/publish', publishSchedule, MGR], ['POST', 'schedules/copy', copySchedule, MGR],
+    ['POST', 'schedules/edit-mode', setEditMode, MGR],
     ['GET', 'timecards', listTimecards, []], ['GET', 'timecards/status', clockStatus, []], ['POST', 'timecards/punch', punch, []],
     ['PUT', 'timecards/:id', updateTimecard, MGR],
     ['GET', 'timeoff', listTimeoff, []], ['POST', 'timeoff', createTimeoff, []], ['PUT', 'timeoff/:id/decision', decideTimeoff, MGR], ['DELETE', 'timeoff/:id', cancelTimeoff, []],

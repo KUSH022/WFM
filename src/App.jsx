@@ -16,6 +16,7 @@ import Budget from './pages/Budget';
 import Forecast from './pages/Forecast';
 import Reports from './pages/Reports';
 import Admin from './pages/Admin';
+import ApiDocs from './pages/ApiDocs';
 import { EmptyState } from './components/ui';
 import { ShieldAlert } from 'lucide-react';
 
@@ -48,6 +49,7 @@ export default function App() {
                     <Route path="forecast" element={<Guard roles={M}><Forecast /></Guard>} />
                     <Route path="reports" element={<Guard roles={M}><Reports /></Guard>} />
                     <Route path="admin" element={<Guard roles={['Administrator']}><Admin /></Guard>} />
+                    <Route path="admin/api-docs" element={<Guard roles={['Administrator']}><ApiDocs /></Guard>} />
                     <Route path="*" element={<EmptyState title="Page not found" message="The page you are looking for does not exist." />} />
                 </Route>
             </Routes>

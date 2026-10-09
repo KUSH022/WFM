@@ -1,6 +1,7 @@
 /** Minimal HTTP helpers that work on both Vercel functions and the local Node dev server. */
 export class HttpError extends Error {
-    constructor(status, message) { super(message); this.status = status; }
+    /** @param details optional array of individual validation messages (returned to the client as `details`) */
+    constructor(status, message, details) { super(message); this.status = status; this.details = details; }
 }
 
 export async function readBody(req) {
@@ -8,11 +9,11 @@ export async function readBody(req) {
     try {
         if (req.body && typeof req.body === 'object') return req.body;
         if (typeof req.body === 'string') return req.body ? JSON.parse(req.body) : {};
-    } catch { return {}; }
-    return new Promise((resolve) => {
+    } catch { throw new HttpError(400, 'Request body is not valid JSON'); }
+    return new Promise((resolve, reject) => {
         let data = '';
         req.on('data', (c) => (data += c));
-        req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch { resolve({}); } });
+        req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch { reject(new HttpError(400, 'Request body is not valid JSON')); } });
         req.on('error', () => resolve({}));
     });
 }

@@ -26,8 +26,12 @@ export default function Employees() {
         downloadCsv('employees.csv', cols.filter((c) => c.key !== 'actions').map((c) => ({ key: c.csv || c.key, label: c.label })), all.items.map((e) => ({ ...e, name: `${e.firstName} ${e.lastName}` })));
     };
     const deactivate = async () => {
-        try { await api(`/employees/${confirm._id}`, { method: 'DELETE' }); toast.success('Employee deactivated'); setConfirm(null); reload(); load(true); }
-        catch (e) { toast.error(e.message); }
+        try {
+            const r = await api(`/employees/${confirm._id}`, { method: 'DELETE' });
+            toast.success('Employee deactivated');
+            if (r.releasedShifts) toast.warning(`${r.releasedShifts} future shift(s) were released to open shifts.`);
+            setConfirm(null); reload(); load(true);
+        } catch (e) { toast.error(e.message); }
     };
 
     const cols = [
@@ -64,7 +68,7 @@ export default function Employees() {
                 <DataTable columns={cols} rows={data?.items || []} loading={loading} page={data?.page || 1} pages={data?.pages || 1} total={data?.total || 0} onPage={(p) => setF((x) => ({ ...x, page: p }))} />}
             {edit && <EmployeeForm employee={edit} meta={meta} onClose={() => setEdit(null)} onSaved={() => { setEdit(null); reload(); load(true); }} />}
             <ConfirmModal open={!!confirm} danger title="Deactivate employee" confirmLabel="Deactivate" onClose={() => setConfirm(null)} onConfirm={deactivate}
-                message={`${confirm?.firstName} ${confirm?.lastName} will be marked inactive and can no longer be scheduled. History is preserved.`} />
+                message={`${confirm?.firstName} ${confirm?.lastName} will be marked inactive and can no longer be scheduled. Future shifts are released to open shifts. History is preserved.`} />
         </>
     );
 }
@@ -73,17 +77,23 @@ function EmployeeForm({ employee, meta, onClose, onSaved }) {
     const isNew = !employee._id;
     const avail = Object.fromEntries((employee.availability || DAYS.map((d) => ({ day: d, available: d !== 'sun' }))).map((a) => [a.day, a.available]));
     const { register, handleSubmit, formState: { errors, isSubmitting } } = useForm({
-        defaultValues: { employmentType: 'Full-Time', employmentStatus: 'Active', status: 'Active', hireDate: new Date().toISOString().slice(0, 10), ...employee, avail },
+        defaultValues: {
+            employmentType: 'Full-Time', employmentStatus: 'Active', status: 'Active', hireDate: new Date().toISOString().slice(0, 10), ...employee, avail,
+            skillsText: (employee.skills || []).join(', ')
+        },
     });
     const submit = async (v) => {
-        const { avail: a, _id, createdAt, locationName, managerName, ...rest } = v;
-        const body = { ...rest, availability: DAYS.map((d) => ({ day: d, available: !!a[d] })) };
+        const { avail: a, _id, createdAt, updatedAt, locationName, managerName, skillsText, skills, ...rest } = v;
+        const body = { ...rest, availability: DAYS.map((d) => ({ day: d, available: !!a[d] })), skills: skillsText.split(',').map((s) => s.trim()).filter(Boolean) };
         try {
-            await api(isNew ? '/employees' : `/employees/${employee._id}`, { method: isNew ? 'POST' : 'PUT', body });
-            toast.success(isNew ? 'Employee created' : 'Employee updated'); onSaved();
+            const r = await api(isNew ? '/employees' : `/employees/${employee._id}`, { method: isNew ? 'POST' : 'PUT', body });
+            toast.success(isNew ? 'Employee created' : 'Employee updated');
+            if (r.releasedShifts) toast.warning(`${r.releasedShifts} future shift(s) were released to open shifts because the employee is no longer active.`);
+            onSaved();
         } catch (e) { toast.error(e.message); }
     };
     const req = { required: 'Required' };
+    const defaultSkills = meta?.employees.find((x) => x._id === employee._id)?.effectiveSkills;
     return (
         <Modal open title={isNew ? 'Add Employee' : `Edit ${employee.firstName} ${employee.lastName}`} onClose={onClose} size="max-w-3xl"
             footer={<><button className="btn-secondary" onClick={onClose}>Cancel</button><button className="btn-primary" disabled={isSubmitting} onClick={handleSubmit(submit)}>{isSubmitting && <Spinner className="h-4 w-4 text-white" />}Save</button></>}>
@@ -102,8 +112,12 @@ function EmployeeForm({ employee, meta, onClose, onSaved }) {
                 <Field label="Manager"><select className="input" {...register('managerId')}><option value="">None</option>{meta?.managers.filter((m) => m._id !== employee._id).map((m) => <option key={m._id} value={m._id}>{m.firstName} {m.lastName} – {m.jobTitle}</option>)}</select></Field>
                 <Field label="Employment status"><select className="input" {...register('employmentStatus')}><option>Active</option><option>On Leave</option><option>Terminated</option></select></Field>
                 <Field label="Active / Inactive"><select className="input" {...register('status')}><option>Active</option><option>Inactive</option></select></Field>
+                <Field label="Skills (comma separated)">
+                    <input className="input" list="kp-skills" placeholder={defaultSkills?.length ? `Job defaults: ${defaultSkills.join(', ')}` : 'e.g. Sales, Key Holder'} {...register('skillsText')} />
+                    <datalist id="kp-skills">{meta?.skills?.map((s) => <option key={s} value={s} />)}</datalist>
+                </Field>
                 <div className="sm:col-span-2 lg:col-span-3">
-                    <label className="label">Availability</label>
+                    <label className="label">Availability (checked before every shift assignment)</label>
                     <div className="flex flex-wrap gap-2">
                         {DAYS.map((d) => <label key={d} className="flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm capitalize"><input type="checkbox" {...register(`avail.${d}`)} />{d}</label>)}
                     </div>

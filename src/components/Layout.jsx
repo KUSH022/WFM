@@ -1,7 +1,7 @@
 /** App shell: role-based sidebar navigation + top bar. */
 import { useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Users, MapPin, CalendarDays, Clock, Timer, Plane, Wallet, TrendingUp, FileBarChart, Settings, LogOut, Menu, X, CalendarCheck } from 'lucide-react';
+import { LayoutDashboard, Users, MapPin, CalendarDays, Clock, Timer, Plane, Wallet, TrendingUp, FileBarChart, Settings, LogOut, Menu, X, CalendarCheck, BookOpen } from 'lucide-react';
 import { useAuth } from '../store/authStore';
 import { Badge } from './ui';
 
@@ -18,6 +18,7 @@ export const NAV = [
     { to: '/forecast', label: 'Forecasting', icon: TrendingUp, roles: ['Manager', 'Administrator'] },
     { to: '/reports', label: 'Reports', icon: FileBarChart, roles: ['Manager', 'Administrator'] },
     { to: '/admin', label: 'Administration', icon: Settings, roles: ['Administrator'] },
+    { to: '/admin/api-docs', label: 'API Documentation', icon: BookOpen, roles: ['Administrator'], child: true },
 ];
 
 export default function Layout() {
@@ -33,9 +34,9 @@ export default function Layout() {
                 <div><p className="font-bold text-slate-900 leading-tight">KP Workforce</p><p className="text-[11px] text-slate-500">KP Retail Group</p></div>
             </div>
             <nav className="flex-1 overflow-y-auto p-3 space-y-0.5">
-                {items.map(({ to, label, icon: Icon }) => (
-                    <NavLink key={to} to={to} end={to === '/'} onClick={() => setOpen(false)}
-                        className={({ isActive }) => `flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition ${isActive ? 'bg-brand-50 text-brand-700' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'}`}>
+                {items.map(({ to, label, icon: Icon, child }) => (
+                    <NavLink key={to} to={to} end={to === '/' || to === '/admin'} onClick={() => setOpen(false)}
+                        className={({ isActive }) => `flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition ${child ? 'ml-4' : ''} ${isActive ? 'bg-brand-50 text-brand-700' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'}`}>
                         <Icon className="h-[18px] w-[18px]" />{label}
                     </NavLink>
                 ))}

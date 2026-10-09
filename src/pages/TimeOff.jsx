@@ -83,7 +83,10 @@ function RequestForm({ mgr, onClose, onSaved }) {
 
 function DecisionModal({ t, decision, onClose, onSaved }) {
     const [comment, setComment] = useState('');
-    const submit = async () => { try { await api(`/timeoff/${t._id}/decision`, { method: 'PUT', body: { decision, comment } }); toast.success(`Request ${decision.toLowerCase()}`); onSaved(); } catch (e) { toast.error(e.message); } };
+    const submit = async () => {
+        try { const r = await api(`/timeoff/${t._id}/decision`, { method: 'PUT', body: { decision, comment } }); toast.success(`Request ${decision.toLowerCase()}`); toast.warnings(r.warnings); onSaved(); }
+        catch (e) { toast.error(e.message); }
+    };
     return (
         <Modal open title={`${decision === 'Approved' ? 'Approve' : 'Reject'} request`} onClose={onClose}
             footer={<><button className="btn-secondary" onClick={onClose}>Cancel</button><button className={decision === 'Approved' ? 'btn-primary' : 'btn-danger'} onClick={submit}>{decision === 'Approved' ? 'Approve' : 'Reject'}</button></>}>

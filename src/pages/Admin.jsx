@@ -1,7 +1,8 @@
-/** Administration: users, roles & permissions, system settings, organization configuration, audit logs. */
+/** Administration: users, roles & permissions, system settings (incl. WFM scheduling rules), organization, audit logs. */
 import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
-import { Plus, Pencil, Trash2, RotateCcw, ShieldCheck, Check } from 'lucide-react';
+import { Plus, Pencil, Trash2, RotateCcw, ShieldCheck, Check, BookOpen } from 'lucide-react';
 import { useFetch } from '../hooks/useFetch';
 import { useMeta } from '../store/metaStore';
 import { api } from '../lib/api';
@@ -15,7 +16,8 @@ export default function Admin() {
     const [tab, setTab] = useState('users');
     return (
         <>
-            <PageHeader title="Administration" subtitle="Users, roles, system settings, organization and audit trail" />
+            <PageHeader title="Administration" subtitle="Users, roles, system settings, organization and audit trail"
+                actions={<Link to="/admin/api-docs" className="btn-secondary"><BookOpen className="h-4 w-4" />API Documentation</Link>} />
             <Tabs value={tab} onChange={setTab} tabs={[{ value: 'users', label: 'Users' }, { value: 'roles', label: 'Roles' }, { value: 'settings', label: 'System Settings' }, { value: 'org', label: 'Organization' }, { value: 'audit', label: 'Audit Logs' }]} />
             {tab === 'users' && <UsersTab />}
             {tab === 'roles' && <RolesTab />}
@@ -116,33 +118,54 @@ function SettingsTab() {
     const reseed = async () => { setBusy(true); try { await api('/admin/reseed', { method: 'POST' }); toast.success('Demo data has been reset'); setReset(false); useMeta.getState().load(true); reload(); } catch (e) { toast.error(e.message); } finally { setBusy(false); } };
     return (
         <div className="grid lg:grid-cols-2 gap-4">
-            <SettingsForm s={data.system} onSaved={reload} />
-            <Card title="Demo Data">
-                <p className="text-sm text-slate-600 mb-4">Reset the database to the original KP Retail Group demo data set (50 employees, 5 locations, current-week schedules, timecards, forecasts and budgets). All changes will be lost.</p>
-                <button className="btn-danger" onClick={() => setReset(true)} disabled={busy}>{busy ? <Spinner className="h-4 w-4 text-white" /> : <RotateCcw className="h-4 w-4" />}Reset demo data</button>
-            </Card>
+            <SettingsForm s={data.system} onSaved={() => { reload(); useMeta.getState().load(true); }} />
+            <div className="space-y-4">
+                <Card title="Demo Data">
+                    <p className="text-sm text-slate-600 mb-4">Reset the database to the original KP Retail Group demo data set (50 employees, 5 locations, current-week schedules, timecards, forecasts and budgets). All changes will be lost.</p>
+                    <button className="btn-danger" onClick={() => setReset(true)} disabled={busy}>{busy ? <Spinner className="h-4 w-4 text-white" /> : <RotateCcw className="h-4 w-4" />}Reset demo data</button>
+                </Card>
+                <Card title="How scheduling rules are applied">
+                    <ul className="text-sm text-slate-600 list-disc pl-5 space-y-1">
+                        <li>Rules run on every shift create, edit, open-shift assignment, employee pickup and inbound API import.</li>
+                        <li>Hard rules block the change (HTTP 422) and list every violation.</li>
+                        <li>Labor budget and overtime are warnings – the change is saved and the user is alerted.</li>
+                        <li>Existing seeded shifts are not modified; rules apply to new changes.</li>
+                    </ul>
+                </Card>
+            </div>
             <ConfirmModal open={reset} danger title="Reset demo data?" confirmLabel="Reset" message="This will delete all data and re-seed the demo company. Continue?" onClose={() => setReset(false)} onConfirm={reseed} />
         </div>
     );
 }
 
+const NUM_FIELDS = [
+    ['overtimeThresholdWeekly', 'Weekly overtime threshold (hrs)'], ['overtimeThresholdDaily', 'Daily overtime threshold (hrs)'],
+    ['maxDailyHours', 'Max scheduled hours / day'], ['maxWeeklyHours', 'Max scheduled hours / week'],
+    ['minRestHours', 'Minimum rest between shifts (hrs)'], ['maxShiftHours', 'Max single shift length (hrs)'],
+    ['budgetWarningPct', 'Labor budget warning at (%)'], ['lateGraceMinutes', 'Late grace period (min)'],
+    ['mealBreakAfterHours', 'Meal break required after (hrs)'], ['minMealMinutes', 'Minimum meal (min)'],
+    ['schedulePublishLeadDays', 'Publish lead time (days)'], ['sessionHours', 'Session length (hrs)'],
+];
+const BOOL_FIELDS = [
+    ['enforceAvailability', 'Block assignments on unavailable days / approved time off'], ['enforceDepartmentMatch', 'Employee department must match shift department'],
+    ['enforceSkills', 'Employee must have the shift\'s required skills'], ['requireEditModeForPublished', 'Published schedules require Edit Mode'],
+    ['preventDuplicateOpenShifts', 'Prevent duplicate open shifts'], ['allowShiftPickup', 'Allow employees to pick up open shifts'],
+    ['logReadRequests', 'Log read-only (GET) API requests in the audit log'],
+];
+
 function SettingsForm({ s, onSaved }) {
     const { register, handleSubmit, formState: { isSubmitting } } = useForm({ defaultValues: s });
     const save = async (v) => {
-        const body = Object.fromEntries(Object.entries(v).map(([k, x]) => [k, typeof s[k] === 'number' ? Number(x) : typeof s[k] === 'boolean' ? !!x : x]));
+        const body = Object.fromEntries(Object.entries(v).filter(([k]) => k !== '_id').map(([k, x]) => [k, typeof s[k] === 'number' ? Number(x) : typeof s[k] === 'boolean' ? !!x : x]));
         try { await api('/admin/settings/system', { method: 'PUT', body }); toast.success('System settings saved'); onSaved(); } catch (e) { toast.error(e.message); }
     };
     return (
-        <Card title="System Settings" actions={<button className="btn-primary btn-sm" disabled={isSubmitting} onClick={handleSubmit(save)}>Save</button>}>
+        <Card title="System Settings & WFM Rules" actions={<button className="btn-primary btn-sm" disabled={isSubmitting} onClick={handleSubmit(save)}>Save</button>}>
             <div className="grid grid-cols-2 gap-4">
-                <Field label="Weekly overtime threshold (hrs)"><input type="number" className="input" {...register('overtimeThresholdWeekly')} /></Field>
-                <Field label="Daily overtime threshold (hrs)"><input type="number" className="input" {...register('overtimeThresholdDaily')} /></Field>
-                <Field label="Late grace period (min)"><input type="number" className="input" {...register('lateGraceMinutes')} /></Field>
-                <Field label="Meal break required after (hrs)"><input type="number" className="input" {...register('mealBreakAfterHours')} /></Field>
-                <Field label="Minimum meal (min)"><input type="number" className="input" {...register('minMealMinutes')} /></Field>
-                <Field label="Publish lead time (days)"><input type="number" className="input" {...register('schedulePublishLeadDays')} /></Field>
-                <Field label="Session length (hrs)"><input type="number" className="input" {...register('sessionHours')} /></Field>
-                <label className="flex items-center gap-2 text-sm mt-6"><input type="checkbox" {...register('allowShiftPickup')} />Allow employees to pick up open shifts</label>
+                {NUM_FIELDS.map(([k, label]) => <Field key={k} label={label}><input type="number" min={0} className="input" {...register(k)} /></Field>)}
+                <div className="col-span-2 space-y-2 pt-2 border-t">
+                    {BOOL_FIELDS.map(([k, label]) => <label key={k} className="flex items-center gap-2 text-sm"><input type="checkbox" {...register(k)} />{label}</label>)}
+                </div>
             </div>
         </Card>
     );
@@ -175,24 +198,31 @@ function OrgForm({ o, onSaved }) {
     );
 }
 
+const ACTIONS = ['LOGIN', 'CREATE', 'UPDATE', 'DELETE', 'ASSIGN', 'UNASSIGN', 'RELEASE', 'EDIT_MODE', 'PUBLISH', 'COPY', 'APPROVE', 'REJECT', 'PUNCH', 'EXPORT', 'GENERATE',
+    'INBOUND', 'INBOUND_PARTIAL', 'API_REQUEST', 'API_FAILURE', 'SEED', 'RESET'];
 function AuditTab() {
-    const [f, setF] = useState({ q: '', action: '', page: 1, limit: 15 });
+    const [f, setF] = useState({ q: '', action: '', entity: '', page: 1, limit: 15 });
     const { data, loading, error, reload } = useFetch('/admin/audit', f);
     if (error) return <ErrorState message={error} onRetry={reload} />;
-    const tone = { CREATE: 'green', DELETE: 'red', LOGIN: 'gray', PUBLISH: 'blue', APPROVE: 'green', REJECT: 'red', UPDATE: 'yellow' };
+    const tone = {
+        CREATE: 'green', DELETE: 'red', LOGIN: 'gray', PUBLISH: 'blue', APPROVE: 'green', REJECT: 'red', UPDATE: 'yellow', ASSIGN: 'green', UNASSIGN: 'yellow',
+        API_FAILURE: 'red', API_REQUEST: 'gray', EDIT_MODE: 'purple', RELEASE: 'yellow', INBOUND: 'blue', INBOUND_PARTIAL: 'yellow'
+    };
     return (
         <>
             <div className="flex flex-col sm:flex-row gap-3 mb-4">
                 <SearchBar className="flex-1" value={f.q} onChange={(q) => setF({ ...f, q, page: 1 })} placeholder="Search details or user…" />
                 <select className="input sm:w-48" value={f.action} onChange={(e) => setF({ ...f, action: e.target.value, page: 1 })}><option value="">All actions</option>
-                    {['LOGIN', 'CREATE', 'UPDATE', 'DELETE', 'PUBLISH', 'COPY', 'APPROVE', 'REJECT', 'PUNCH', 'EXPORT', 'GENERATE', 'SEED', 'RESET'].map((a) => <option key={a}>{a}</option>)}</select>
+                    {ACTIONS.map((a) => <option key={a}>{a}</option>)}</select>
+                <select className="input sm:w-48" value={f.entity} onChange={(e) => setF({ ...f, entity: e.target.value, page: 1 })}><option value="">All entities</option>
+                    {['Shift', 'Open Shift', 'Schedule', 'Employee', 'Location', 'Time Off', 'Timecard', 'Labor Budget', 'Settings', 'Integration', 'API', 'Auth', 'User'].map((a) => <option key={a}>{a}</option>)}</select>
             </div>
             <DataTable loading={loading} rows={data?.items || []} page={f.page} pages={data?.pages || 1} total={data?.total || 0} onPage={(p) => setF({ ...f, page: p })} columns={[
                 { key: 'timestamp', label: 'Timestamp', render: (l) => dateTime(l.timestamp) },
                 { key: 'userName', label: 'User', render: (l) => <div><p className="font-medium">{l.userName}</p><p className="text-xs text-slate-500">{l.role}</p></div> },
                 { key: 'action', label: 'Action', render: (l) => <Badge tone={tone[l.action] || 'blue'}>{l.action}</Badge> },
                 { key: 'entity', label: 'Entity' },
-                { key: 'details', label: 'Details', className: 'max-w-[420px] truncate' },
+                { key: 'details', label: 'Details', className: 'max-w-[520px] whitespace-normal text-xs', render: (l) => l.details },
             ]} />
         </>
     );

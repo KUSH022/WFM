@@ -15,7 +15,10 @@ export default function MySchedule() {
     const { data, loading, error, reload } = useFetch('/shifts', { weekStart: ymd(ws) });
     const mine = (data || []).filter((s) => s.employeeId === user.employeeId);
     const open = (data || []).filter((s) => !s.employeeId);
-    const claim = async (s) => { try { await api(`/shifts/${s._id}/claim`, { method: 'POST' }); toast.success('Shift picked up!'); reload(); } catch (e) { toast.error(e.message); } };
+    const claim = async (s) => {
+        try { const r = await api(`/shifts/${s._id}/claim`, { method: 'POST' }); toast.success('Shift picked up!'); toast.warnings(r.warnings); reload(); }
+        catch (e) { toast.error(e.message); }
+    };
 
     return (
         <>
