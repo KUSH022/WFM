@@ -109,7 +109,7 @@ export const ENTITIES = {
         },
         async outbound(db, q, ctx) {
             return Object.values(ctx.emp)
-                .filter((e) => (!q.locationCode || ctx.locById[e.locationId]?.code === q.locationCode) && (!q.status || e.status === q.status) && (!q.department || e.department === q.department))
+                .filter((e) => (!q.employeeId || e.employeeId === q.employeeId) && (!q.locationCode || ctx.locById[e.locationId]?.code === q.locationCode) && (!q.status || e.status === q.status) && (!q.department || e.department === q.department))
                 .map((e) => ({
                     employeeId: e.employeeId, firstName: e.firstName, lastName: e.lastName, email: e.email, phone: e.phone, locationCode: ctx.locById[e.locationId]?.code,
                     locationName: e.locationName, department: e.department, jobTitle: e.jobTitle, hireDate: e.hireDate, hourlyRate: e.hourlyRate, employmentType: e.employmentType,
@@ -117,7 +117,7 @@ export const ENTITIES = {
                 }))
                 .sort((a, b) => a.employeeId.localeCompare(b.employeeId));
         },
-        filters: { locationCode: 'Location code', status: 'Active | Inactive', department: 'Department name' },
+        filters: { employeeId: 'Employee business ID (exact match)', locationCode: 'Location code', status: 'Active | Inactive', department: 'Department name' },
     },
 
     locations: {
@@ -149,12 +149,12 @@ export const ENTITIES = {
             return 'inserted';
         },
         async outbound(db, q, ctx) {
-            return Object.values(ctx.locById).filter((l) => !q.region || l.region === q.region).map((l) => ({
+            return Object.values(ctx.locById).filter((l) => (!q.code || l.code === q.code) && (!q.region || l.region === q.region)).map((l) => ({
                 code: l.code, name: l.name, region: l.region, address: l.address, city: l.city,
                 phone: l.phone, costCenter: l.costCenter, status: l.status, weeklyLaborBudget: l.weeklyLaborBudget, operatingHours: l.operatingHours, departments: l.departments
             }));
         },
-        filters: { region: 'North Region | South Region' },
+        filters: { code: 'Location business code (exact match)', region: 'North Region | South Region' },
     },
 
     schedules: {
